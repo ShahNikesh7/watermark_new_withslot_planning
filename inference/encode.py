@@ -65,7 +65,7 @@ def clear_gpu_memory():
     gc.collect()
 
 def process_chunk_memory_efficient(model, chunk, device, clear_cache=True):
-    """Process a single chunk with memory optimization"""
+    """Process a single chunk with memory optimization and transient preservation"""
     if clear_cache:
         clear_gpu_memory()
     
@@ -74,7 +74,10 @@ def process_chunk_memory_efficient(model, chunk, device, clear_cache=True):
     
     # Process with gradient disabled to save memory
     with torch.no_grad():
+        # Use higher precision for better transient preservation
         result = model.stft(chunk.unsqueeze(0))
+        # Preserve numerical precision
+        result = result.float()
     
     # Move result back to CPU immediately to free GPU memory
     result_cpu = result.cpu()
@@ -85,7 +88,7 @@ def process_chunk_memory_efficient(model, chunk, device, clear_cache=True):
     return result_cpu
 
 def encode_chunk_memory_efficient(model, chunk, m_spec, device, clear_cache=True):
-    """Encode a single chunk with memory optimization"""
+    """Encode a single chunk with memory optimization and transient preservation"""
     if clear_cache:
         clear_gpu_memory()
     
@@ -99,10 +102,16 @@ def encode_chunk_memory_efficient(model, chunk, m_spec, device, clear_cache=True
         if device == 'cuda':
             with torch.cuda.amp.autocast(enabled=False):  # Disable autocast for stability
                 x_wm, _ = model.encode(chunk, m_spec)
-                x_wm = torch.clamp(x_wm, -1.0, 1.0)
+                # Preserve numerical precision and avoid over-clamping
+                x_wm = x_wm.float()
+                # More conservative clamping to preserve dynamics
+                x_wm = torch.clamp(x_wm, -0.99, 0.99)
         else:
             x_wm, _ = model.encode(chunk, m_spec)
-            x_wm = torch.clamp(x_wm, -1.0, 1.0)
+            # Preserve numerical precision and avoid over-clamping
+            x_wm = x_wm.float()
+            # More conservative clamping to preserve dynamics
+            x_wm = torch.clamp(x_wm, -0.99, 0.99)
     
     # Move result back to CPU immediately
     result_cpu = x_wm.cpu()
@@ -128,24 +137,127 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _load_audio_mono(path: str) -> tuple[torch.Tensor, int, str]:
+def _load_audio_stereo(path: str) -> tuple[torch.Tensor, int, str]:
+    """Load audio preserving original characteristics - no normalization"""
     # Prefer soundfile for robust WAV/AIFF reading; fallback to torchaudio
     try:
         data, sr = sf.read(path, dtype="float32", always_2d=True)
-        # data: [T, C] -> mono
-        if data.shape[1] > 1:
-            data = data.mean(axis=1, keepdims=True)
-        wav = torch.from_numpy(data.T)  # [1, T]
+        # data: [T, C] -> [C, T] for torch
+        wav = torch.from_numpy(data.T)  # [C, T]
     except Exception:
         wav, sr = torchaudio.load(path)
-        if wav.size(0) > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-    # normalize peak to 1.0
-    wav = wav / (wav.abs().max() + 1e-9)
-    wav, sr = _resample_if_needed(wav, sr)
+    
     # robust fingerprint
     file_hash_hex = _sha256_file(path)
     return wav, sr, file_hash_hex
+
+
+def _load_audio_mono(path: str) -> tuple[torch.Tensor, int, str]:
+    """Load audio as mono for processing - no normalization"""
+    wav, sr, file_hash_hex = _load_audio_stereo(path)
+    if wav.size(0) > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    return wav, sr, file_hash_hex
+
+
+def _measure_lufs(wav: torch.Tensor, sr: int) -> float:
+    """Measure integrated LUFS using improved RMS approximation with better dynamics preservation"""
+    # Use windowed RMS to better capture dynamics and avoid over-smoothing
+    window_size = int(sr * 0.4)  # 400ms windows for better transient capture
+    if wav.size(-1) < window_size:
+        window_size = wav.size(-1)
+    
+    # Calculate RMS in overlapping windows to preserve transients
+    rms_values = []
+    for i in range(0, wav.size(-1) - window_size + 1, window_size // 2):
+        window = wav[..., i:i + window_size]
+        rms = torch.sqrt(torch.mean(window * window))
+        rms_values.append(rms)
+    
+    if not rms_values:
+        rms = torch.sqrt(torch.mean(wav * wav))
+    else:
+        # Use 90th percentile RMS to avoid being dominated by quiet sections
+        rms_tensor = torch.stack(rms_values)
+        rms = torch.quantile(rms_tensor, 0.9)
+    
+    lufs = 20.0 * torch.log10(rms + 1e-9) - 0.691
+    return float(lufs)
+
+
+def _preserve_dynamic_range(original: torch.Tensor, watermarked: torch.Tensor) -> torch.Tensor:
+    """Preserve the original dynamic range to prevent volume ducking"""
+    # Calculate original dynamic range metrics
+    orig_peak = original.abs().max()
+    orig_rms = torch.sqrt(torch.mean(original * original))
+    
+    # Calculate watermarked dynamic range metrics
+    wm_peak = watermarked.abs().max()
+    wm_rms = torch.sqrt(torch.mean(watermarked * watermarked))
+    
+    # Calculate scaling factors to preserve dynamic range
+    peak_ratio = orig_peak / (wm_peak + 1e-9)
+    rms_ratio = orig_rms / (wm_rms + 1e-9)
+    
+    # Use the more conservative scaling to avoid over-amplification
+    scale_factor = min(peak_ratio, rms_ratio, 1.0)  # Don't amplify beyond original
+    
+    return watermarked * scale_factor
+
+def _apply_loudness_matching(original: torch.Tensor, watermarked: torch.Tensor, target_lufs: float) -> torch.Tensor:
+    """Apply loudness matching to preserve original LUFS while maintaining dynamics"""
+    # First preserve dynamic range to prevent volume ducking
+    watermarked = _preserve_dynamic_range(original, watermarked)
+    
+    current_lufs = _measure_lufs(watermarked, TARGET_SR)
+    lufs_diff = target_lufs - current_lufs
+    gain_db = lufs_diff
+    gain_linear = 10.0 ** (gain_db / 20.0)
+    
+    # Apply gain but preserve true-peak headroom and dynamics
+    matched = watermarked * gain_linear
+    
+    # More conservative limiting to preserve transients
+    peak = matched.abs().max()
+    if peak > 0.98:  # Only limit if very close to clipping
+        # Use gentle compression instead of hard limiting to preserve transients
+        ratio = 0.98 / peak
+        # Apply gentle compression curve to preserve dynamics
+        matched = torch.tanh(matched * (1.0 / 0.98)) * 0.98
+    
+    return matched
+
+
+def _extract_mid_side(stereo: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract mid (sum) and side (difference) components from stereo"""
+    if stereo.size(0) != 2:
+        # If not stereo, return as-is for mid, zeros for side
+        return stereo, torch.zeros_like(stereo)
+    
+    mid = (stereo[0] + stereo[1]) / 2.0  # (L + R) / 2
+    side = (stereo[0] - stereo[1]) / 2.0  # (L - R) / 2
+    return mid.unsqueeze(0), side.unsqueeze(0)
+
+
+def _reconstruct_stereo(mid: torch.Tensor, side: torch.Tensor) -> torch.Tensor:
+    """Reconstruct stereo from mid and side components"""
+    left = mid + side   # L = M + S
+    right = mid - side  # R = M - S
+    return torch.stack([left.squeeze(0), right.squeeze(0)], dim=0)
+
+
+def _upsample_watermark_delta(delta_mono: torch.Tensor, target_sr: int) -> torch.Tensor:
+    """Upsample watermark delta from 22.05kHz to target sample rate"""
+    if target_sr == TARGET_SR:
+        return delta_mono
+    
+    # Use high-quality resampling
+    resampler = torchaudio.transforms.Resample(
+        orig_freq=TARGET_SR, 
+        new_freq=target_sr,
+        resampling_method="sinc_interp_hann"
+    )
+    return resampler(delta_mono)
 
 
 def _chunk_audio_1s(wav: torch.Tensor) -> list[torch.Tensor]:
@@ -273,8 +385,8 @@ def main():
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--per_sec_capacity", type=int, default=512, help="Max payload slots per second")
     parser.add_argument("--repeat", type=int, default=3, help="Repetitions per bit across placements")
-    parser.add_argument("--base_symbol_amp", type=float, default=0.08)
-    parser.add_argument("--sync_rel_amp", type=float, default=0.5, help="sync amp = rel * base_symbol_amp")
+    parser.add_argument("--base_symbol_amp", type=float, default=0.06, help="Reduced default amplitude to prevent volume ducking")
+    parser.add_argument("--sync_rel_amp", type=float, default=0.4, help="sync amp = rel * base_symbol_amp (reduced to prevent interference)")
     parser.add_argument("--sync_k_freq", type=int, default=8)
     parser.add_argument("--sync_k_time", type=int, default=3)
     parser.add_argument("--sync_f_low", type=float, default=200.0)
@@ -310,7 +422,7 @@ def main():
 
     print(f"Loading checkpoint: {ckpt_path}")
     # Load checkpoint with memory optimization
-    state = torch.load(ckpt_path, map_location=args.device)
+    state = torch.load(ckpt_path, map_location=args.device, weights_only=False)
     cfg = state.get("cfg", {})
     n_fft = int(cfg.get("n_fft", 1024))
     hop = int(cfg.get("hop", 512))
@@ -321,6 +433,9 @@ def main():
     model = model.to(args.device)
     model.eval()
     
+    # Get model hash for reproducibility before deleting state
+    model_hash = hashlib.sha256(str(state.get("model_state", {})).encode()).hexdigest()[:16]
+    
     # Clear checkpoint from memory
     del state
     clear_gpu_memory()
@@ -329,12 +444,32 @@ def main():
     if torch.cuda.is_available():
         print(f"GPU memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
-    # Load audio
+    # Load audio preserving original characteristics
     print(f"Loading audio: {audio_path}")
-    wav, sr, file_hash_hex = _load_audio_mono(audio_path)
-    if sr != TARGET_SR:
-        raise RuntimeError(f"Unexpected SR after resample: {sr}")
-    chunks = _chunk_audio_1s(wav)  # list of [1,T]
+    wav_stereo, original_sr, file_hash_hex = _load_audio_stereo(audio_path)
+    print(f"Original: {wav_stereo.shape}, {original_sr} Hz")
+    
+    # Extract mid and side components for stereo processing
+    mid_component, side_component = _extract_mid_side(wav_stereo)
+    print(f"Mid component: {mid_component.shape}, Side component: {side_component.shape}")
+    
+    # Measure original LUFS for loudness matching
+    original_lufs = _measure_lufs(mid_component, original_sr)
+    print(f"Original LUFS: {original_lufs:.2f} dB")
+    
+    # Resample mid component to 22.05kHz for watermarking
+    if original_sr != TARGET_SR:
+        print(f"Resampling mid component from {original_sr} Hz to {TARGET_SR} Hz for watermarking")
+        mid_resampler = torchaudio.transforms.Resample(
+            orig_freq=original_sr, 
+            new_freq=TARGET_SR,
+            resampling_method="sinc_interp_hann"
+        )
+        mid_22k = mid_resampler(mid_component)
+    else:
+        mid_22k = mid_component
+    
+    chunks = _chunk_audio_1s(mid_22k)  # list of [1,T] at 22.05kHz
 
     # Build payload bytes from metadata string using 6-bit packer (demo)
     # metadata format: key=value;key=value;...
@@ -358,6 +493,9 @@ def main():
     rs_n, rs_k = 167, 125
     interleaved = interleave_bytes(rs_code, args.interleave)
     all_bits: List[int] = _bytes_to_bits(interleaved)
+    
+    # Compute payload checksum for verification
+    payload_checksum = hashlib.sha256(interleaved).hexdigest()
 
     # Plan per-second payload slots and sync bins
     placements_per_sec: List[List[Tuple[int,int,float,int]]] = []  # [(f,t,amp,bit_index)]
@@ -458,17 +596,39 @@ def main():
     print(f"Total bits: {num_bits}, repetition: {args.repeat}, using placements: {len(filtered_global)}")
     print(f"First 10 bits: {all_bits[:10]}")
     placements_per_sec = [[] for _ in range(len(chunks))]
+    
+    # Track repetition distribution for each bit
+    bit_distribution: Dict[int, Dict[str, any]] = {}
+    for bit_idx in range(num_bits):
+        bit_distribution[bit_idx] = {
+            "seconds_covered": set(),
+            "frames_covered": set(),
+            "total_placements": 0
+        }
+    
     for k, (sidx, f, t, a) in enumerate(filtered_global):
         bit_index = k % num_bits  # round-robin ensures r repeats per bit
         bit_val = all_bits[bit_index]
         amp = (1.0 if bit_val == 1 else -1.0) * args.base_symbol_amp * float(a)
         placements_per_sec[sidx].append((int(f), int(t), float(amp), int(bit_index)))
+        
+        # Track distribution for this bit
+        bit_distribution[bit_index]["seconds_covered"].add(sidx)
+        bit_distribution[bit_index]["frames_covered"].add(t)
+        bit_distribution[bit_index]["total_placements"] += 1
+        
         if k < 10:  # Debug first 10 placements
             print(f"Placement {k}: sec={sidx}, bit_idx={bit_index}, bit_val={bit_val}, amp={amp:.3f}")
+    
+    # Convert sets to lists for JSON serialization
+    for bit_idx in bit_distribution:
+        bit_distribution[bit_idx]["seconds_covered"] = sorted(list(bit_distribution[bit_idx]["seconds_covered"]))
+        bit_distribution[bit_idx]["frames_covered"] = sorted(list(bit_distribution[bit_idx]["frames_covered"]))
 
     # Encode per second, adding sync spectrogram on top of payload spectrogram
     sync_amp = args.sync_rel_amp * args.base_symbol_amp
     wm_chunks: List[torch.Tensor] = []
+    clipping_telemetry: List[Dict[str, float]] = []
     print("Embedding per second...")
     for sec_idx, ch in enumerate(chunks):
         print(f"Encoding second {sec_idx + 1}/{len(chunks)}...")
@@ -480,23 +640,48 @@ def main():
         # Create message spectrogram on CPU to save GPU memory
         M_spec = torch.zeros_like(X)
 
-        # Payload symbols
+        # Payload symbols with improved amplitude scaling
         for (f, t, amp, _bit_idx) in placements_per_sec[sec_idx]:
             if 0 <= f < Fbins and 0 <= t < Tframes:
-                M_spec[0, 0, f, t] = float(amp)
+                # Scale amplitude more conservatively to preserve dynamics
+                scaled_amp = float(amp) * 0.9  # Reduce watermark amplitude slightly
+                M_spec[0, 0, f, t] = scaled_amp
 
-        # Sync symbols (BPSK on real channel) - use separate channel to avoid interference
+        # Sync symbols (BPSK on imaginary channel) - use separate channel to avoid interference
         sync_bins = sync_per_sec[sec_idx]["bins"]
         code_vec = sync_per_sec[sec_idx]["code"]
         for (code, ft) in zip(code_vec, sync_bins):
             f, t = int(ft[0]), int(ft[1])
             if 0 <= f < Fbins and 0 <= t < Tframes:
                 # Use imaginary channel for sync to avoid interference with payload
-                M_spec[0, 1, f, t] = float(code) * float(sync_amp)
+                # Scale sync amplitude more conservatively
+                scaled_sync_amp = float(sync_amp) * 0.8  # Reduce sync amplitude
+                M_spec[0, 1, f, t] = float(code) * scaled_sync_amp
 
         # Encode with memory optimization
         x_wm = encode_chunk_memory_efficient(model, ch, M_spec, args.device)
         wm_chunks.append(x_wm)
+        
+        # Record clipping telemetry for this second
+        pre_clip_max = float(x_wm.abs().max().item())
+        clipped_samples = int((x_wm.abs() >= 0.99).sum().item())
+        total_samples = x_wm.numel()
+        clipping_ratio = clipped_samples / max(1, total_samples)
+        headroom_db = 20.0 * math.log10(max(1e-6, 1.0 / pre_clip_max))
+        
+        # Calculate average per-slot amplitude scale for this second
+        slot_amps = [abs(amp) for (_, _, amp, _) in placements_per_sec[sec_idx]]
+        avg_slot_amp_scale = sum(slot_amps) / max(1, len(slot_amps)) if slot_amps else 0.0
+        
+        clipping_telemetry.append({
+            "second": sec_idx,
+            "pre_clip_peak": pre_clip_max,
+            "clipped_samples": clipped_samples,
+            "total_samples": total_samples,
+            "clipping_ratio": clipping_ratio,
+            "headroom_db": headroom_db,
+            "avg_slot_amp_scale": avg_slot_amp_scale
+        })
         
         # Clear memory after each encoding
         del X, M_spec
@@ -505,22 +690,94 @@ def main():
             if torch.cuda.is_available():
                 print(f"  GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
-    # Concatenate chunks and save
-    x_wm_full = torch.cat([ch.squeeze(0) for ch in wm_chunks], dim=-1)  # [1,T]
+    # Concatenate watermarked mid component
+    mid_wm_22k = torch.cat([ch.squeeze(0) for ch in wm_chunks], dim=-1)  # [1,T] at 22.05kHz
+    print(f"Watermarked mid component: {mid_wm_22k.shape}")
+    
+    # Calculate watermark delta (difference between original and watermarked)
+    # Use the same chunking as the watermarked version to ensure matching lengths
+    mid_original_22k = torch.cat([ch.squeeze(0) for ch in chunks], dim=-1)
+    print(f"Original mid component: {mid_original_22k.shape}")
+    
+    # Ensure both tensors have the same length
+    min_length = min(mid_wm_22k.size(-1), mid_original_22k.size(-1))
+    mid_wm_22k = mid_wm_22k[..., :min_length]
+    mid_original_22k = mid_original_22k[..., :min_length]
+    
+    watermark_delta_22k = mid_wm_22k - mid_original_22k
+    print(f"Watermark delta: {watermark_delta_22k.shape}")
+    
+    # Upsample watermark delta to original sample rate
+    if original_sr != TARGET_SR:
+        print(f"Upsampling watermark delta from {TARGET_SR} Hz to {original_sr} Hz")
+        watermark_delta_original = _upsample_watermark_delta(watermark_delta_22k, original_sr)
+    else:
+        watermark_delta_original = watermark_delta_22k
+    
+    # Ensure watermark delta matches original mid component length
+    target_length = mid_component.size(-1)
+    if watermark_delta_original.size(-1) != target_length:
+        print(f"Adjusting watermark delta length from {watermark_delta_original.size(-1)} to {target_length}")
+        if watermark_delta_original.size(-1) > target_length:
+            # Truncate if too long
+            watermark_delta_original = watermark_delta_original[..., :target_length]
+        else:
+            # Pad with zeros if too short
+            pad_length = target_length - watermark_delta_original.size(-1)
+            watermark_delta_original = F.pad(watermark_delta_original, (0, pad_length))
+    
+    # Apply watermark delta to original mid component with better precision
+    mid_wm_original = mid_component + watermark_delta_original
+    
+    # Ensure we maintain the same data type for consistency
+    mid_wm_original = mid_wm_original.float()
+    
+    # Apply loudness matching to preserve original LUFS
+    print("Applying loudness matching...")
+    mid_wm_matched = _apply_loudness_matching(mid_component, mid_wm_original, original_lufs)
+    
+    # Reconstruct stereo: watermarked mid + original side
+    wav_wm_stereo = _reconstruct_stereo(mid_wm_matched, side_component)
+    
+    # Ensure consistent data type
+    wav_wm_stereo = wav_wm_stereo.float()
+    
+    # Final gentle limiting to prevent clipping while preserving dynamics
+    peak = wav_wm_stereo.abs().max()
+    if peak > 0.99:
+        print(f"Applying gentle limiting: peak was {peak:.3f}")
+        # Use gentle compression instead of hard limiting to preserve transients
+        wav_wm_stereo = torch.tanh(wav_wm_stereo * (1.0 / 0.99)) * 0.99
+    
+    # Measure final LUFS
+    final_lufs = _measure_lufs(mid_wm_matched, original_sr)
+    print(f"Final LUFS: {final_lufs:.2f} dB (target: {original_lufs:.2f} dB)")
+    print(f"LUFS difference: {final_lufs - original_lufs:.2f} dB")
+    
     print(f"Saving watermarked audio to: {out_wav_path}")
-    torchaudio.save(out_wav_path, x_wm_full.detach().cpu(), sample_rate=TARGET_SR)
+    torchaudio.save(out_wav_path, wav_wm_stereo.detach().cpu(), sample_rate=original_sr)
 
     # Build JSON slots map
     fingerprint = file_hash_hex
-    # Get model hash for reproducibility
-    model_hash = hashlib.sha256(str(state.get("model_state", {})).encode()).hexdigest()[:16]
     slots_json = {
         "schema_version": "1.0",
         "audio_fingerprint": fingerprint,
         "model_id": os.path.basename(ckpt_path),
         "model_hash": model_hash,
-        "sample_rate": TARGET_SR,
+        "original_sample_rate": original_sr,
+        "processing_sample_rate": TARGET_SR,
         "stft": {"n_fft": n_fft, "hop": hop, "win_length": n_fft},
+        "audio_processing": {
+            "preserve_mix_master": True,
+            "stereo_processing": "mid_side",
+            "mid_component_watermarked": True,
+            "side_component_preserved": True,
+            "original_lufs": original_lufs,
+            "final_lufs": final_lufs,
+            "lufs_difference": final_lufs - original_lufs,
+            "upsampling_method": "sinc_interp_hann",
+            "loudness_matching_applied": True
+        },
         "planner_seed": int(args.seed),
         "sync_spec": asdict(SyncSpec(
             code_family="barker13",
@@ -531,6 +788,20 @@ def main():
             f_low_hz=float(args.sync_f_low),
             f_high_hz=float(args.sync_f_high),
         )),
+        "sync_indexing_contract": {
+            "encoding_method": "phase_shift_plus_amplitude_modulation",
+            "phase_shift": "sec_idx % code_length",
+            "amplitude_levels": 4,
+            "amplitude_modulation": "1.0 + 0.1 * (sec_idx % 4)",
+            "detection_channel": "imaginary",
+            "correlation_method": "normalized_dot_product",
+            "recovery_rule": "test_phase_shifts_0_to_min(100, total_seconds) and select_best_correlation"
+        },
+        "channel_assignments": {
+            "payload_channel": "real",
+            "sync_channel": "imaginary",
+            "rationale": "payload_on_real_avoids_interference_with_sync_on_imaginary"
+        },
         "payload_spec": asdict(PayloadSpec(
             payload_bytes=int(args.payload_bytes),
             rs_n=167,
@@ -538,6 +809,14 @@ def main():
             interleave_depth=int(args.interleave),
             bit_order="LSB-first-per-byte",
         )),
+        "payload_verification": {
+            "checksum": payload_checksum,
+            "coded_bytes": 167,
+            "coded_bits": 1336,
+            "interleave_preserves_length": True,
+            "original_metadata": args.metadata,
+            "packer_version": "6bit_fields_v1"
+        },
         "repeat": int(args.repeat),
         "base_symbol_amp": float(args.base_symbol_amp),
         "psychoacoustic_params": {
@@ -547,6 +826,32 @@ def main():
             "total_available_slots": int(len(filtered_global)),
             "total_required_slots": int(need),
             "capacity_utilization": float(len(filtered_global) / max(1, need)) if need > 0 else 0.0
+        },
+        "capacity_policy": {
+            "capacity_ok": total_capacity >= required_capacity,
+            "final_repeat": int(args.repeat),
+            "effective_target_bits": int(num_bits),
+            "total_encoded_symbols": int(len(filtered_global)),
+            "capacity_warning_issued": total_capacity < required_capacity
+        },
+        "repetition_distribution": {
+            "policy": "round_robin_with_global_shuffle",
+            "min_seconds_per_bit": min(len(bit_distribution[bit_idx]["seconds_covered"]) for bit_idx in bit_distribution) if bit_distribution else 0,
+            "max_seconds_per_bit": max(len(bit_distribution[bit_idx]["seconds_covered"]) for bit_idx in bit_distribution) if bit_distribution else 0,
+            "min_frames_per_bit": min(len(bit_distribution[bit_idx]["frames_covered"]) for bit_idx in bit_distribution) if bit_distribution else 0,
+            "max_frames_per_bit": max(len(bit_distribution[bit_idx]["frames_covered"]) for bit_idx in bit_distribution) if bit_distribution else 0,
+            "per_bit_summary": {str(bit_idx): bit_distribution[bit_idx] for bit_idx in bit_distribution}
+        },
+        "clipping_telemetry": {
+            "global_stats": {
+                "max_peak_across_all_seconds": max(t["pre_clip_peak"] for t in clipping_telemetry) if clipping_telemetry else 0.0,
+                "total_clipped_samples": sum(t["clipped_samples"] for t in clipping_telemetry),
+                "total_samples": sum(t["total_samples"] for t in clipping_telemetry),
+                "worst_clipping_ratio": max(t["clipping_ratio"] for t in clipping_telemetry) if clipping_telemetry else 0.0,
+                "worst_headroom_db": min(t["headroom_db"] for t in clipping_telemetry) if clipping_telemetry else 0.0,
+                "avg_slot_amp_scale": sum(t["avg_slot_amp_scale"] for t in clipping_telemetry) / max(1, len(clipping_telemetry)) if clipping_telemetry else 0.0
+            },
+            "per_second": clipping_telemetry
         },
         "placements": [],  # list per second
     }

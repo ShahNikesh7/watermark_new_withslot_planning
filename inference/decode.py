@@ -5,15 +5,17 @@ Two-stage decoder for watermarked audio using sync-assisted search.
 Stage A (sync scan, DSP-only):
 - Downmix to mono and resample to 22.05 kHz
 - Slide 1s windows (hop 0.5s) over audio
-- For each window, compute STFT and read real parts at reserved sync bins
-- Correlate with known sync code (Barker-13 tiled) to get a score
-- Keep top candidate windows; cluster contiguous hits into segments
+- For each window, compute STFT and read imaginary parts at per-second sync bins
+- Correlate with stored per-second sync codes to get score and source second index
+- Build segments from contiguous high-sync windows using threshold/hysteresis
 
 Stage B (targeted NN decode):
-- For each candidate segment ±1s margin, process 1s subwindows
+- For each candidate segment, process 1s subwindows
 - Run INNWatermarker.decode on each second
-- Gather payload symbols at placements from slots map (preferred) or allocate
-- Vote across repetitions, deinterleave + RS decode
+- Read payload symbols from encoder's exact placements (no fallback allocation)
+- Use per-second placements and respect encoder's bit accounting
+- Weighted voting with encoder amplitudes and local SNR
+- RS decode with proper gating and BER calculation
 
 Inputs:
 - Audio file (e.g., sampled.wav or watermarked master)
@@ -43,7 +45,7 @@ from pipeline.ingest_and_chunk import (
     rs_decode_167_125,
     rs_encode_167_125,
     deinterleave_bytes,
-    allocate_slots_and_amplitudes,
+    interleave_bytes,
 )
 
 
@@ -64,6 +66,7 @@ class Detection:
     source_sec_offset: int
     num_windows: int
     agreeing_windows: int
+    verified: bool = False
 
 
 def _resample_if_needed(wav: torch.Tensor, sr: int) -> tuple[torch.Tensor, int]:
@@ -74,14 +77,12 @@ def _resample_if_needed(wav: torch.Tensor, sr: int) -> tuple[torch.Tensor, int]:
 
 
 def _load_audio_mono(path: str) -> tuple[torch.Tensor, int]:
+    """Load audio as mono, preserving original characteristics"""
     wav, sr = torchaudio.load(path)
     if wav.size(0) > 1:
         wav = wav.mean(dim=0, keepdim=True)
     wav, sr = _resample_if_needed(wav, sr)
-    # normalize for stable correlation
-    peak = wav.abs().max().item()
-    if peak > 0:
-        wav = wav / peak
+    # No normalization - preserve original levels
     return wav, sr
 
 
@@ -92,133 +93,62 @@ def _slide_indices(T: int, hop: int) -> List[int]:
     return idxs
 
 
-def _build_sync_bins(Fbins: int, Tframes: int, sr: int, n_fft: int, K_freq: int, K_time: int, f_low_hz: float, f_high_hz: float) -> List[Tuple[int, int]]:
-    f_max = sr / 2.0
-    low_bin = max(1, int((f_low_hz / f_max) * (n_fft // 2)))
-    high_bin = min(n_fft // 2, int((f_high_hz / f_max) * (n_fft // 2)))
-    if high_bin <= low_bin:
-        low_bin, high_bin = 1, max(2, n_fft // 4)
-    if K_freq <= 1:
-        freq_bins = [max(1, (low_bin + high_bin) // 2)]
-    else:
-        step = (high_bin - low_bin) / float(K_freq + 1)
-        freq_bins = [int(low_bin + (i + 1) * step) for i in range(K_freq)]
-    if K_time <= 1:
-        time_frames = [max(0, (Tframes - 1) // 2)]
-    else:
-        step_t = max(1.0, (Tframes - 1) / float(K_time + 1))
-        time_frames = [int(round((i + 1) * step_t)) for i in range(K_time)]
-        time_frames = [min(tf, Tframes - 1) for tf in time_frames]
-    bins: List[Tuple[int,int]] = []
-    for ti in time_frames:
-        for fi in freq_bins:
-            bins.append((fi, ti))
-    return bins
-
-
-def _barker13() -> List[int]:
-    seq01 = [1,1,1,1,1,0,0,1,1,0,1,0,1]
-    return [1 if v == 1 else -1 for v in seq01]
-
-
-def _correlate_sync_with_source(model: INNWatermarker, x: torch.Tensor, n_fft: int, hop: int, 
-                               sync_bins: List[Tuple[int, int]], sync_code: List[int]) -> Tuple[float, int]:
+def _correlate_sync_with_source(model: INNWatermarker, x: torch.Tensor, n_fft: int, hop: int,
+                               placements: List[Dict]) -> Tuple[float, int]:
     """
-    Correlate with source sync code and return both score and estimated source second index.
-    
+    Correlate with source sync code using per-second sync bins and return both score and estimated source second index.
+
     Args:
         model: INN model for STFT
         x: [1,1,T] 1s window
         n_fft: STFT n_fft parameter
         hop: STFT hop parameter
-        sync_bins: List of (f, t) tuples for sync bins
-        sync_code: Source sync code vector
-    
+        placements: List of per-second placement data from slots_map
+
     Returns:
         (correlation_score, estimated_source_sec_idx)
     """
-    # x: [1,1,T] 1s window
-    X = model.stft(x)  # [1,2,F,T]
+    X = model.stft(x)  # [1,2,F,T] - sync on imaginary channel (index 1)
     Fbins, Tframes = X.shape[-2], X.shape[-1]
-    
-    # Use provided sync bins and code from source
-    K = len(sync_bins)
-    if K == 0:
-        return 0.0, -1
-    
-    # Use imaginary part for BPSK readout (sync is on channel 1)
-    vals = []
-    for (f, t) in sync_bins:
-        if 0 <= f < Fbins and 0 <= t < Tframes:
-            vals.append(float(X[0, 1, f, t].item()))
-        else:
-            vals.append(0.0)  # Out of bounds bins
-    
-    if len(vals) == 0:
-        return 0.0, -1
-    
-    # Try multiple phase shifts to find the best match and recover source second index
-    base_code = _barker13()
+
     best_score = 0.0
     best_sec_idx = -1
-    
-    # Test different phase shifts (source second indices)
-    for test_sec_idx in range(min(100, len(sync_code))):  # Limit search space
-        # Generate expected code for this source second index
-        if test_sec_idx < len(sync_code):
-            expected_code = sync_code[test_sec_idx]
-        else:
-            # Fallback to rotation-based code if not in stored sync
-            code = (base_code * ((K + len(base_code) - 1) // len(base_code)))[:K]
-            if K > 0 and test_sec_idx % K != 0:
-                r = test_sec_idx % K
-                code = code[r:] + code[:r]
-            expected_code = code
-        
-        if len(expected_code) != len(vals):
+
+    # Test against each source second's sync configuration
+    for test_sec_idx, sec_data in enumerate(placements):
+        if "sync" not in sec_data or "bins" not in sec_data["sync"] or "code" not in sec_data["sync"]:
             continue
             
-        # Normalized correlation
+        sync_bins = sec_data["sync"]["bins"]
+        sync_code = sec_data["sync"]["code"]
+        
+        if len(sync_bins) == 0 or len(sync_code) == 0:
+            continue
+
+        # Extract values from this second's sync bins
+        vals = []
+        for (f, t) in sync_bins:
+            if 0 <= f < Fbins and 0 <= t < Tframes:
+                # Read from imaginary channel (sync channel)
+                vals.append(float(X[0, 1, f, t].item()))
+            else:
+                vals.append(0.0)  # Out of bounds bins
+
+        if len(vals) == 0 or len(vals) != len(sync_code):
+            continue
+
+        # Normalize correlation (scale-invariant)
         v = torch.tensor(vals, dtype=torch.float32)
-        c = torch.tensor(expected_code, dtype=torch.float32)
+        c = torch.tensor(sync_code, dtype=torch.float32)
         v_norm = (v - v.mean()) / (v.std() + 1e-6)
         c_norm = (c - c.mean()) / (c.std() + 1e-6)
         score = float(torch.dot(v_norm, c_norm) / max(1, len(vals)))
-        
+
         if score > best_score:
             best_score = score
             best_sec_idx = test_sec_idx
-    
+
     return best_score, best_sec_idx
-
-
-def _correlate_sync(model: INNWatermarker, x: torch.Tensor, n_fft: int, hop: int, sync_cfg: Dict, sec_index: int) -> float:
-    """Legacy sync correlation function - kept for backward compatibility"""
-    # x: [1,1,T] 1s window
-    X = model.stft(x)  # [1,2,F,T]
-    Fbins, Tframes = X.shape[-2], X.shape[-1]
-    bins = _build_sync_bins(Fbins, Tframes, sr=TARGET_SR, n_fft=n_fft,
-                            K_freq=int(sync_cfg["k_freq"]), K_time=int(sync_cfg["k_time"]),
-                            f_low_hz=float(sync_cfg["f_low_hz"]), f_high_hz=float(sync_cfg["f_high_hz"]))
-    K = len(bins)
-    base = _barker13()
-    code = (base * ((K + len(base) - 1) // len(base)))[:K]
-    if K > 0 and sec_index % K != 0:
-        r = sec_index % K
-        code = code[r:] + code[:r]
-    # Use imaginary part for BPSK readout (sync is on channel 1)
-    vals = []
-    for (f, t) in bins:
-        vals.append(float(X[0, 1, f, t].item()))
-    if len(vals) == 0:
-        return 0.0
-    # normalized correlation
-    v = torch.tensor(vals, dtype=torch.float32)
-    c = torch.tensor(code, dtype=torch.float32)
-    v = (v - v.mean()) / (v.std() + 1e-6)
-    c = (c - c.mean()) / (c.std() + 1e-6)
-    score = float(torch.dot(v, c) / max(1, len(vals)))
-    return score
 
 
 def _bytes_to_bits(by: bytes) -> List[int]:
@@ -240,6 +170,78 @@ def _bits_to_bytes(bits: List[int]) -> bytes:
     return bytes(by)
 
 
+def _calculate_local_snr(X: torch.Tensor, f: int, t: int, window_size: int = 3) -> float:
+    """Calculate local SNR around a frequency-time bin"""
+    Fbins, Tframes = X.shape[-2], X.shape[-1]
+    
+    # Define local window around the bin
+    f_start = max(0, f - window_size // 2)
+    f_end = min(Fbins, f + window_size // 2 + 1)
+    t_start = max(0, t - window_size // 2)
+    t_end = min(Tframes, t + window_size // 2 + 1)
+    
+    # Extract local region
+    local_region = X[0, 0, f_start:f_end, t_start:t_end]
+    
+    # Calculate signal power (magnitude squared)
+    signal_power = local_region.abs().pow(2).mean().item()
+    
+    # Estimate noise power from surrounding region
+    noise_region = X[0, 0, :, :].clone()
+    noise_region[f_start:f_end, t_start:t_end] = 0  # Remove signal region
+    noise_power = noise_region.abs().pow(2).mean().item()
+    
+    # Calculate SNR in dB
+    if noise_power > 1e-10:
+        snr_db = 10.0 * math.log10(signal_power / noise_power)
+        return max(0.0, snr_db)  # Clamp to positive values
+    else:
+        return 30.0  # High SNR if noise is very low
+
+
+def _build_segments_from_sync(sync_results: List[Tuple[float, int, int]], 
+                             threshold: float, 
+                             hysteresis_low: float) -> List[Tuple[int, int, int]]:
+    """Build segments from contiguous high-sync windows using threshold/hysteresis"""
+    if not sync_results:
+        return []
+    
+    # Sort by start position
+    sync_results.sort(key=lambda x: x[1])
+    
+    segments = []
+    current_segment = None
+    
+    for score, start_sample, source_sec_idx in sync_results:
+        if score >= threshold:
+            if current_segment is None:
+                # Start new segment
+                current_segment = (start_sample, start_sample + WIN_S, source_sec_idx)
+            else:
+                # Extend current segment if close enough
+                if start_sample - current_segment[1] <= int(0.75 * TARGET_SR):
+                    current_segment = (current_segment[0], start_sample + WIN_S, source_sec_idx)
+                else:
+                    # Close current segment and start new one
+                    segments.append(current_segment)
+                    current_segment = (start_sample, start_sample + WIN_S, source_sec_idx)
+        elif current_segment is not None and score >= hysteresis_low:
+            # Continue segment with lower threshold
+            if start_sample - current_segment[1] <= int(0.75 * TARGET_SR):
+                current_segment = (current_segment[0], start_sample + WIN_S, source_sec_idx)
+        else:
+            # Close current segment
+            if current_segment is not None:
+                segments.append(current_segment)
+                current_segment = None
+    
+    # Close final segment
+    if current_segment is not None:
+        segments.append(current_segment)
+    
+    return segments
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", type=str, default="sampled.wav")
@@ -247,7 +249,8 @@ def main():
     parser.add_argument("--ckpt", type=str, default=os.path.join("checkpoints", "inn_decode_best.pt"))
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--hop_sec", type=float, default=0.5)
-    parser.add_argument("--topk", type=int, default=8, help="Keep top-K sync windows for Stage B")
+    parser.add_argument("--sync_threshold", type=float, default=0.3, help="Sync correlation threshold")
+    parser.add_argument("--hysteresis_low", type=float, default=0.15, help="Lower threshold for segment continuation")
     parser.add_argument("--out_detections", type=str, default="detections.json", help="Output detections JSON")
     args = parser.parse_args()
 
@@ -260,17 +263,30 @@ def main():
     if schema_version != "1.0":
         print(f"Warning: Schema version {schema_version} may not be compatible")
     
+    # Read STFT parameters from slots_map (must match encoder)
     stft_cfg = slots_map.get("stft", {"n_fft": 1024, "hop": 512, "win_length": 1024})
     n_fft = int(stft_cfg.get("n_fft", 1024))
     hop = int(stft_cfg.get("hop", 512))
-    sync_cfg = slots_map.get("sync_spec", {})
-    payload_cfg = slots_map.get("payload_spec", {})
-    repeat = int(slots_map.get("repeat", 1))
+    
+    # Read payload specification from slots_map
+    payload_spec = slots_map.get("payload_spec", {})
+    payload_bytes = int(payload_spec.get("payload_bytes", 125))
+    coded_bytes = int(payload_spec.get("coded_bytes", 167))
+    coded_bits = int(payload_spec.get("coded_bits", 1336))
+    interleave_depth = int(payload_spec.get("interleave_depth", 4))
+    bit_order = payload_spec.get("bit_order", "LSB-first-per-byte")
+    
+    # Read per-second placements
     placements = slots_map.get("placements", [])
-    psychoacoustic_params = slots_map.get("psychoacoustic_params", {})
-
+    if not placements:
+        raise RuntimeError("No placements found in slots_map.json")
+    
+    # Read payload verification data
+    payload_verification = slots_map.get("payload_verification", {})
+    expected_checksum = payload_verification.get("checksum", "")
+    
     # Build model
-    state = torch.load(args.ckpt, map_location=args.device)
+    state = torch.load(args.ckpt, map_location=args.device, weights_only=False)
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": n_fft, "hop_length": hop, "win_length": n_fft}).to(args.device)
     model.load_state_dict(state.get("model_state", state), strict=False)
     model.eval()
@@ -285,25 +301,12 @@ def main():
         print("Warning: Audio shorter than 1 second, padding to 1 second")
         wav = torch.nn.functional.pad(wav, (0, WIN_S - wav.size(-1)))
 
-    # Stage A: sync scan using source sync from slots_map
+    # Stage A: sync scan using per-second sync bins from slots_map
     hop_samp = max(1, int(args.hop_sec * TARGET_SR))
     starts = _slide_indices(wav.size(-1), hop=hop_samp)
     sync_results: List[Tuple[float, int, int]] = []  # (score, start_sample, source_sec_idx)
-    
-    # Get sync bins and codes from first placement entry
-    sync_bins = []
-    sync_codes = []
-    if placements and len(placements) > 0:
-        first_sync = placements[0].get("sync", {})
-        sync_bins = [(int(f), int(t)) for f, t in first_sync.get("bins", [])]
-        sync_codes = [first_sync.get("code", [])]
-        # Collect all sync codes from all seconds
-        for placement in placements:
-            sync = placement.get("sync", {})
-            if "code" in sync:
-                sync_codes.append(sync["code"])
 
-    print(f"Stage A: Scanning {len(starts)} windows with source sync...")
+    print(f"Stage A: Scanning {len(starts)} windows with per-second sync...")
     for i, st in enumerate(starts):
         win = wav[:, st:st + WIN_S]
         if win.size(-1) < WIN_S:
@@ -311,41 +314,16 @@ def main():
         
         x = win.to(args.device).unsqueeze(0)
         
-        if sync_bins and sync_codes:
-            # Use source sync correlation
-            score, source_sec_idx = _correlate_sync_with_source(model, x, n_fft, hop, sync_bins, sync_codes)
-            sync_results.append((score, st, source_sec_idx))
-        else:
-            # Fallback to legacy method
-            sec_index = st // WIN_S
-            score = _correlate_sync(model, x, n_fft=n_fft, hop=hop, sync_cfg=sync_cfg, sec_index=sec_index)
-            sync_results.append((score, st, sec_index))
+        # Use per-second sync correlation
+        score, source_sec_idx = _correlate_sync_with_source(model, x, n_fft, hop, placements)
+        sync_results.append((score, st, source_sec_idx))
 
-    # Keep top-K and cluster contiguous
-    sync_results.sort(key=lambda z: z[0], reverse=True)
-    top = sync_results[:max(1, args.topk)]
-    # simple clustering by proximity (<= 0.75s apart)
-    top_starts = sorted([(st, src_sec) for (_s, st, src_sec) in top])
-    segments: List[Tuple[int, int, int]] = []  # (start, end, source_sec_offset)
-    if top_starts:
-        cur_s, cur_e, cur_src = top_starts[0][0], top_starts[0][0] + WIN_S, top_starts[0][1]
-        for s, src_sec in top_starts[1:]:
-            if s - cur_e <= int(0.75 * TARGET_SR):
-                cur_e = s + WIN_S
-                # Use the most common source second in the segment
-                if src_sec == cur_src:
-                    cur_src = src_sec
-            else:
-                segments.append((cur_s, cur_e, cur_src))
-                cur_s, cur_e, cur_src = s, s + WIN_S, src_sec
-        segments.append((cur_s, cur_e, cur_src))
-
+    # Build segments using threshold/hysteresis
+    segments = _build_segments_from_sync(sync_results, args.sync_threshold, args.hysteresis_low)
     print(f"Stage B: Processing {len(segments)} candidate segments...")
     
     # Stage B: targeted NN decode around segments
     detections: List[Detection] = []
-    rs_payload_bytes = int(payload_cfg.get("payload_bytes", 125))
-    interleave_depth = int(payload_cfg.get("interleave_depth", 4))
 
     # Helper: read placements for a given source second index
     def get_source_placements(source_sec_idx: int) -> List[Tuple[int, int, int, float]]:
@@ -364,180 +342,263 @@ def main():
     for seg_idx, (seg_s, seg_e, source_sec_offset) in enumerate(segments):
         print(f"  Processing segment {seg_idx + 1}/{len(segments)}: {seg_s}-{seg_e} (source offset: {source_sec_offset})")
         
-        # extend by ±1s margin
-        s = max(0, seg_s - WIN_S)
-        e = min(wav.size(-1), seg_e + WIN_S)
-        
-        # Collect votes with weighted voting
+        # Collect votes with weighted voting using encoder amplitudes and local SNR
         all_votes: Dict[int, List[Tuple[int, float]]] = {}  # bit_idx -> [(vote, weight), ...]
         window_count = 0
         
-        cursor = s
-        while cursor < e:
+        cursor = seg_s
+        while cursor < seg_e:
             win = wav[:, cursor:cursor + WIN_S]
             if win.size(-1) < WIN_S:
                 win = torch.nn.functional.pad(win, (0, WIN_S - win.size(-1)))
             
             x = win.to(args.device).unsqueeze(0)
             M_rec = model.decode(x)  # [1,2,F,T]
+            X_stft = model.stft(x)  # For SNR calculation
             
             # Calculate source second index for this window
-            window_source_sec = source_sec_offset + (cursor - seg_s) // WIN_S
+            # The source_sec_offset is the detected source second from sync correlation
+            # We need to map the current window position to the corresponding source second
+            window_offset_seconds = (cursor - seg_s) // WIN_S
+            window_source_sec = source_sec_offset + window_offset_seconds
+            
+            # Clamp to available placements range
+            max_source_sec = len(placements) - 1
+            window_source_sec = max(0, min(window_source_sec, max_source_sec))
             pl = get_source_placements(window_source_sec)
             
             if not pl:
-                # fallback: allocate slots from received audio content
-                Xrx = model.stft(x)
-                slots, _amp = allocate_slots_and_amplitudes(Xrx, TARGET_SR, n_fft, target_bits=167*8, amp_safety=1.0)
-                pl = [(int(f), int(t), i, 1.0) for i, (f, t) in enumerate(slots[:167*8])]
+                # Skip window if no placements found (no fallback allocation)
+                print(f"    Warning: No placements found for source second {window_source_sec}, skipping window")
+                cursor += WIN_S
+                continue
 
             for (f, t, bit_idx, amp_weight) in pl:
-                val = float(M_rec[0, 0, f, t].item())
+                if bit_idx >= coded_bits:
+                    continue  # Skip out-of-bounds bit indices
+                    
+                val = float(M_rec[0, 0, f, t].item())  # Payload on real channel
                 bit = 1 if val >= 0.0 else 0
-                # Use amplitude as weight for voting
-                all_votes.setdefault(bit_idx, []).append((bit, abs(amp_weight)))
+                
+                # Calculate local SNR for this bin
+                local_snr = _calculate_local_snr(X_stft, f, t)
+                snr_weight = min(1.0, local_snr / 20.0)  # Normalize SNR to 0-1 range
+                
+                # Combined weight: encoder amplitude × local SNR
+                combined_weight = abs(amp_weight) * snr_weight
+                
+                all_votes.setdefault(bit_idx, []).append((bit, combined_weight))
             
             window_count += 1
             cursor += WIN_S
 
-        if all_votes:
-            # Weighted majority vote per bit index
-            max_idx = max(all_votes.keys())
-            bits: List[int] = []
-            bit_weights: List[float] = []
-            
-            for i in range(max_idx + 1):
-                votes = all_votes.get(i, [])
-                if votes:
-                    # Weighted voting
-                    total_weight = sum(weight for _, weight in votes)
-                    weighted_ones = sum(weight for bit, weight in votes if bit == 1)
-                    bit = 1 if weighted_ones >= total_weight / 2.0 else 0
-                    bits.append(bit)
-                    bit_weights.append(total_weight)
-                else:
-                    bits.append(0)  # Default to 0 for missing bits
-                    bit_weights.append(0.0)
+        if not all_votes:
+            print(f"    No valid votes collected for segment {seg_idx + 1}")
+            continue
 
-            # Calculate confidence and BER
-            margins = []
-            for i in range(len(bits)):
-                votes = all_votes.get(i, [])
-                if votes:
-                    total_weight = sum(weight for _, weight in votes)
-                    weighted_ones = sum(weight for bit, weight in votes if bit == 1)
-                    p = weighted_ones / max(1e-6, total_weight)
-                    margins.append(abs(p - 0.5) * 2.0)
-            
-            confidence = float(sum(margins) / max(1, len(margins))) if margins else 0.0
-
-            # RS decode
-            byte_stream = _bits_to_bytes(bits)
-            deint = deinterleave_bytes(byte_stream, interleave_depth)
-            rs_ok = False
-            recovered_payload: Optional[bytes] = None
-            
-            try:
-                payload = rs_decode_167_125(deint)
-                recovered_payload = payload[:rs_payload_bytes]
-                rs_ok = True
-            except Exception as e:
-                print(f"    RS decode failed: {e}")
-                recovered_payload = None
-
-            # Calculate BER
-            ber = 0.0
-            if recovered_payload is not None:
-                # Re-encode to calculate BER
-                try:
-                    rs_code = rs_encode_167_125(recovered_payload)
-                    interleaved = interleave_bytes(rs_code, interleave_depth)
-                    expected_bits = _bytes_to_bits(interleaved)
-                    if len(expected_bits) == len(bits):
-                        errors = sum(1 for a, b in zip(expected_bits, bits) if a != b)
-                        ber = errors / len(bits)
-                except Exception:
-                    ber = 1.0
-
-            # Calculate agreeing windows
-            agreeing_windows = 0
-            if recovered_payload is not None:
-                # Count windows that agree with the decoded payload
-                try:
-                    rs_code = rs_encode_167_125(recovered_payload)
-                    interleaved = interleave_bytes(rs_code, interleave_depth)
-                    expected_bits = _bytes_to_bits(interleaved)
-                    
-                    cursor = s
-                    while cursor < e:
-                        win = wav[:, cursor:cursor + WIN_S]
-                        if win.size(-1) < WIN_S:
-                            win = torch.nn.functional.pad(win, (0, WIN_S - win.size(-1)))
-                        
-                        x = win.to(args.device).unsqueeze(0)
-                        M_rec = model.decode(x)
-                        
-                        window_source_sec = source_sec_offset + (cursor - seg_s) // WIN_S
-                        pl = get_source_placements(window_source_sec)
-                        
-                        if not pl:
-                            Xrx = model.stft(x)
-                            slots, _amp = allocate_slots_and_amplitudes(Xrx, TARGET_SR, n_fft, target_bits=167*8, amp_safety=1.0)
-                            pl = [(int(f), int(t), i, 1.0) for i, (f, t) in enumerate(slots[:167*8])]
-
-                        window_agrees = True
-                        for (f, t, bit_idx, _) in pl:
-                            if bit_idx < len(expected_bits):
-                                val = float(M_rec[0, 0, f, t].item())
-                                bit = 1 if val >= 0.0 else 0
-                                if bit != expected_bits[bit_idx]:
-                                    window_agrees = False
-                                    break
-                        
-                        if window_agrees:
-                            agreeing_windows += 1
-                        
-                        cursor += WIN_S
-                except Exception:
-                    pass
-
-            # Create detection
-            if recovered_payload is not None:
-                try:
-                    text = recovered_payload.decode("utf-8", errors="ignore")
-                except Exception:
-                    text = ""
+        # Weighted majority vote per bit index
+        bits: List[int] = []
+        bit_weights: List[float] = []
+        
+        for i in range(coded_bits):
+            votes = all_votes.get(i, [])
+            if votes:
+                # Weighted voting
+                total_weight = sum(weight for _, weight in votes)
+                weighted_ones = sum(weight for bit, weight in votes if bit == 1)
+                bit = 1 if weighted_ones >= total_weight / 2.0 else 0
+                bits.append(bit)
+                bit_weights.append(total_weight)
             else:
-                text = ""
+                bits.append(0)  # Default to 0 for missing bits
+                bit_weights.append(0.0)
 
-            # Use hysteresis to expand/contract detected segment
-            start_s = float(seg_s / TARGET_SR)
-            end_s = float(seg_e / TARGET_SR)
+        # Calculate confidence from voting margins
+        margins = []
+        for i in range(len(bits)):
+            votes = all_votes.get(i, [])
+            if votes:
+                total_weight = sum(weight for _, weight in votes)
+                weighted_ones = sum(weight for bit, weight in votes if bit == 1)
+                p = weighted_ones / max(1e-6, total_weight)
+                margins.append(abs(p - 0.5) * 2.0)
+        
+        confidence = float(sum(margins) / max(1, len(margins))) if margins else 0.0
+
+        # RS decode with proper gating
+        byte_stream = _bits_to_bytes(bits)
+        if len(byte_stream) < coded_bytes:
+            byte_stream = byte_stream + b'\x00' * (coded_bytes - len(byte_stream))
+        elif len(byte_stream) > coded_bytes:
+            byte_stream = byte_stream[:coded_bytes]
             
-            # Simple hysteresis: expand by 0.5s on each side if confidence is high
-            if confidence > 0.7:
-                start_s = max(0.0, start_s - 0.5)
-                end_s = min(wav.size(-1) / TARGET_SR, end_s + 0.5)
+        deint = deinterleave_bytes(byte_stream, interleave_depth)
+        rs_ok = False
+        recovered_payload: Optional[bytes] = None
+        
+        try:
+            payload = rs_decode_167_125(deint)
+            recovered_payload = payload[:payload_bytes]
+            rs_ok = True
+        except Exception as e:
+            print(f"    RS decode failed: {e}")
+            recovered_payload = None
 
-            detection = Detection(
-                start_s=start_s,
-                end_s=end_s,
-                confidence=confidence,
-                ber=ber,
-                rs_ok=rs_ok,
-                payload_snippet=text[:256],
-                source_sec_offset=source_sec_offset,
-                num_windows=window_count,
-                agreeing_windows=agreeing_windows
-            )
-            detections.append(detection)
+        # Only proceed if RS decode succeeded
+        if not rs_ok or recovered_payload is None:
+            print(f"    Segment {seg_idx + 1} failed RS decode, skipping")
+            continue
 
-    # Save detections
+        # Calculate BER against re-encoded payload
+        ber = 0.0
+        try:
+            rs_code = rs_encode_167_125(recovered_payload)
+            interleaved = interleave_bytes(rs_code, interleave_depth)
+            expected_bits = _bytes_to_bits(interleaved)
+            if len(expected_bits) == len(bits):
+                errors = sum(1 for a, b in zip(expected_bits, bits) if a != b)
+                ber = errors / len(bits)
+        except Exception:
+            ber = 1.0
+
+        # Calculate agreeing windows
+        agreeing_windows = 0
+        try:
+            rs_code = rs_encode_167_125(recovered_payload)
+            interleaved = interleave_bytes(rs_code, interleave_depth)
+            expected_bits = _bytes_to_bits(interleaved)
+            
+            cursor = seg_s
+            while cursor < seg_e:
+                win = wav[:, cursor:cursor + WIN_S]
+                if win.size(-1) < WIN_S:
+                    win = torch.nn.functional.pad(win, (0, WIN_S - win.size(-1)))
+                
+                x = win.to(args.device).unsqueeze(0)
+                M_rec = model.decode(x)
+                
+                window_offset_seconds = (cursor - seg_s) // WIN_S
+                window_source_sec = source_sec_offset + window_offset_seconds
+                
+                # Clamp to available placements range
+                max_source_sec = len(placements) - 1
+                window_source_sec = max(0, min(window_source_sec, max_source_sec))
+                pl = get_source_placements(window_source_sec)
+                
+                if not pl:
+                    cursor += WIN_S
+                    continue
+
+                window_agrees = True
+                for (f, t, bit_idx, _) in pl:
+                    if bit_idx < len(expected_bits):
+                        val = float(M_rec[0, 0, f, t].item())
+                        bit = 1 if val >= 0.0 else 0
+                        if bit != expected_bits[bit_idx]:
+                            window_agrees = False
+                            break
+                
+                if window_agrees:
+                    agreeing_windows += 1
+                
+                cursor += WIN_S
+        except Exception:
+            pass
+
+        # Verify payload if checksum is available
+        verified = False
+        if expected_checksum:
+            try:
+                rs_code = rs_encode_167_125(recovered_payload)
+                interleaved = interleave_bytes(rs_code, interleave_depth)
+                import hashlib
+                actual_checksum = hashlib.sha256(interleaved).hexdigest()
+                verified = (actual_checksum == expected_checksum)
+            except Exception:
+                pass
+
+        # Create detection
+        try:
+            text = recovered_payload.decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+
+        # Use sync-based boundaries with single NN confirmation
+        start_s = float(seg_s / TARGET_SR)
+        end_s = float(seg_e / TARGET_SR)
+        
+        # Confirm edges with single NN pass
+        edge_confirmed_start = start_s
+        edge_confirmed_end = end_s
+        
+        # Check start edge
+        if seg_s >= WIN_S:
+            edge_win = wav[:, seg_s - WIN_S:seg_s]
+            if edge_win.size(-1) == WIN_S:
+                edge_x = edge_win.to(args.device).unsqueeze(0)
+                edge_score, _ = _correlate_sync_with_source(model, edge_x, n_fft, hop, placements)
+                if edge_score >= args.hysteresis_low:
+                    edge_confirmed_start = float((seg_s - WIN_S) / TARGET_SR)
+        
+        # Check end edge
+        if seg_e + WIN_S <= wav.size(-1):
+            edge_win = wav[:, seg_e:seg_e + WIN_S]
+            if edge_win.size(-1) == WIN_S:
+                edge_x = edge_win.to(args.device).unsqueeze(0)
+                edge_score, _ = _correlate_sync_with_source(model, edge_x, n_fft, hop, placements)
+                if edge_score >= args.hysteresis_low:
+                    edge_confirmed_end = float((seg_e + WIN_S) / TARGET_SR)
+
+        detection = Detection(
+            start_s=edge_confirmed_start,
+            end_s=edge_confirmed_end,
+            confidence=confidence,
+            ber=ber,
+            rs_ok=rs_ok,
+            payload_snippet=text[:256],
+            source_sec_offset=source_sec_offset,
+            num_windows=window_count,
+            agreeing_windows=agreeing_windows,
+            verified=verified
+        )
+        detections.append(detection)
+
+    # Merge detections that are close together
+    merged_detections = []
+    if detections:
+        detections.sort(key=lambda d: d.start_s)
+        current = detections[0]
+        
+        for next_det in detections[1:]:
+            if next_det.start_s - current.end_s <= 0.5:  # Within 0.5 seconds
+                # Merge detections
+                current = Detection(
+                    start_s=current.start_s,
+                    end_s=max(current.end_s, next_det.end_s),
+                    confidence=max(current.confidence, next_det.confidence),
+                    ber=min(current.ber, next_det.ber),
+                    rs_ok=current.rs_ok or next_det.rs_ok,
+                    payload_snippet=current.payload_snippet if current.confidence >= next_det.confidence else next_det.payload_snippet,
+                    source_sec_offset=current.source_sec_offset,
+                    num_windows=current.num_windows + next_det.num_windows,
+                    agreeing_windows=current.agreeing_windows + next_det.agreeing_windows,
+                    verified=current.verified or next_det.verified
+                )
+            else:
+                merged_detections.append(current)
+                current = next_det
+        
+        merged_detections.append(current)
+
+    # Save detections with provenance
     detections_data = {
         "schema_version": "1.0",
         "audio_file": args.audio,
         "slots_file": args.slots,
-        "total_detections": len(detections),
+        "model_id": slots_map.get("model_id", "unknown"),
+        "model_hash": slots_map.get("model_hash", "unknown"),
+        "stft_config": stft_cfg,
+        "total_detections": len(merged_detections),
         "detections": [
             {
                 "start_s": d.start_s,
@@ -549,40 +610,32 @@ def main():
                 "source_sec_offset": d.source_sec_offset,
                 "num_windows": d.num_windows,
                 "agreeing_windows": d.agreeing_windows,
-                "agreement_ratio": d.agreeing_windows / max(1, d.num_windows)
+                "verified": d.verified
             }
-            for d in detections
+            for d in merged_detections
         ]
     }
-    
+
     with open(args.out_detections, "w", encoding="utf-8") as f:
         json.dump(detections_data, f, indent=2)
 
-    # Report
-    print(f"\nDetection Summary:")
-    print(f"  Total candidates: {len(segments)}")
-    print(f"  Successful detections: {len(detections)}")
-    
-    for i, det in enumerate(detections):
-        print(f"\nDetection {i + 1}:")
+    # Print summary
+    print(f"\n=== Detection Summary ===")
+    print(f"Total detections: {len(merged_detections)}")
+    for i, det in enumerate(merged_detections):
+        print(f"Detection {i+1}:")
         print(f"  Time: {det.start_s:.2f}s - {det.end_s:.2f}s")
         print(f"  Confidence: {det.confidence:.3f}")
         print(f"  BER: {det.ber:.3f}")
-        print(f"  RS Success: {det.rs_ok}")
+        print(f"  RS OK: {det.rs_ok}")
+        print(f"  Verified: {det.verified}")
+        print(f"  Payload: {det.payload_snippet}")
         print(f"  Source offset: {det.source_sec_offset}")
-        print(f"  Windows: {det.agreeing_windows}/{det.num_windows} agreeing")
-        if det.payload_snippet:
-            print(f"  Payload: {det.payload_snippet}")
-        else:
-            print("  Payload: (empty)")
-    
-    if not detections:
-        print("No payload recovered")
+        print(f"  Windows: {det.agreeing_windows}/{det.num_windows}")
+        print()
+
+    print(f"Detections saved to: {args.out_detections}")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
