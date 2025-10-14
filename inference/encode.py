@@ -25,6 +25,7 @@ import json
 import math
 import hashlib
 import random
+import gc
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple
 
@@ -32,6 +33,10 @@ import torch
 import torchaudio
 import soundfile as sf
 import torch.nn.functional as F
+
+# Memory optimization settings
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
 # Resolve paths relative to script dir and repo root
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -51,6 +56,61 @@ from pipeline.ingest_and_chunk import (
 TARGET_SR = 22050
 CHUNK_SECONDS = 1.0
 CHUNK_SAMPLES = int(TARGET_SR * CHUNK_SECONDS)
+
+# Memory optimization functions
+def clear_gpu_memory():
+    """Clear GPU memory and run garbage collection"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+def process_chunk_memory_efficient(model, chunk, device, clear_cache=True):
+    """Process a single chunk with memory optimization"""
+    if clear_cache:
+        clear_gpu_memory()
+    
+    # Move chunk to device
+    chunk = chunk.to(device, non_blocking=True)
+    
+    # Process with gradient disabled to save memory
+    with torch.no_grad():
+        result = model.stft(chunk.unsqueeze(0))
+    
+    # Move result back to CPU immediately to free GPU memory
+    result_cpu = result.cpu()
+    del chunk, result
+    if clear_cache:
+        clear_gpu_memory()
+    
+    return result_cpu
+
+def encode_chunk_memory_efficient(model, chunk, m_spec, device, clear_cache=True):
+    """Encode a single chunk with memory optimization"""
+    if clear_cache:
+        clear_gpu_memory()
+    
+    # Move tensors to device
+    chunk = chunk.to(device, non_blocking=True)
+    m_spec = m_spec.to(device, non_blocking=True)
+    
+    # Process with gradient disabled and autocast for memory efficiency
+    with torch.no_grad():
+        # Use autocast for mixed precision if available
+        if device == 'cuda':
+            with torch.cuda.amp.autocast(enabled=False):  # Disable autocast for stability
+                x_wm, _ = model.encode(chunk, m_spec)
+                x_wm = torch.clamp(x_wm, -1.0, 1.0)
+        else:
+            x_wm, _ = model.encode(chunk, m_spec)
+            x_wm = torch.clamp(x_wm, -1.0, 1.0)
+    
+    # Move result back to CPU immediately
+    result_cpu = x_wm.cpu()
+    del chunk, m_spec, x_wm
+    if clear_cache:
+        clear_gpu_memory()
+    
+    return result_cpu
 
 
 def _resample_if_needed(wav: torch.Tensor, sr: int) -> tuple[torch.Tensor, int]:
@@ -188,6 +248,9 @@ def main():
     parser.add_argument("--sync_k_time", type=int, default=3)
     parser.add_argument("--sync_f_low", type=float, default=200.0)
     parser.add_argument("--sync_f_high", type=float, default=2000.0)
+    # Memory optimization options
+    parser.add_argument("--batch_size", type=int, default=1, help="Process multiple seconds at once (1 for memory efficiency)")
+    parser.add_argument("--clear_cache_freq", type=int, default=1, help="Clear GPU cache every N seconds")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -215,13 +278,25 @@ def main():
         os.makedirs(slots_dir, exist_ok=True)
 
     print(f"Loading checkpoint: {ckpt_path}")
+    # Load checkpoint with memory optimization
     state = torch.load(ckpt_path, map_location=args.device)
     cfg = state.get("cfg", {})
     n_fft = int(cfg.get("n_fft", 1024))
     hop = int(cfg.get("hop", 512))
-    model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": n_fft, "hop_length": hop, "win_length": n_fft}).to(args.device)
+    
+    # Create model and move to device
+    model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": n_fft, "hop_length": hop, "win_length": n_fft})
     model.load_state_dict(state.get("model_state", state), strict=False)
+    model = model.to(args.device)
     model.eval()
+    
+    # Clear checkpoint from memory
+    del state
+    clear_gpu_memory()
+    
+    # Print memory usage
+    if torch.cuda.is_available():
+        print(f"GPU memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
     # Load audio
     print(f"Loading audio: {audio_path}")
@@ -262,11 +337,13 @@ def main():
     # expand/tiling to K_freq*K_time length (deterministic; optionally rotate per-second)
 
     print("Planning slots and sync per second...")
-    # First pass: compute per-second candidate payload slots
+    # First pass: compute per-second candidate payload slots with memory optimization
     per_sec_candidates: List[List[Tuple[int,int,float]]] = []  # [(f,t,amp_scale)]
     for sec_idx, ch in enumerate(chunks):
-        x = ch.to(args.device).unsqueeze(0)
-        X = model.stft(x)  # [1,2,F,T]
+        print(f"Processing second {sec_idx + 1}/{len(chunks)}...")
+        
+        # Use memory-efficient processing
+        X = process_chunk_memory_efficient(model, ch, args.device)
         Fbins, Tframes = X.shape[-2], X.shape[-1]
 
         # Sync bins for this second
@@ -297,6 +374,13 @@ def main():
             amp_scale = float(amp_per_slot[i]) if i < len(amp_per_slot) else 1.0
             cand.append((int(f), int(t), amp_scale))
         per_sec_candidates.append(cand)
+        
+        # Clear memory after each second
+        del X
+        if sec_idx % args.clear_cache_freq == 0:
+            clear_gpu_memory()
+            if torch.cuda.is_available():
+                print(f"  GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
     # Flatten global placements list from candidates
     global_slots: List[Tuple[int,int,int,float]] = []  # (sec_idx, f, t, amp_scale)
@@ -341,9 +425,13 @@ def main():
     wm_chunks: List[torch.Tensor] = []
     print("Embedding per second...")
     for sec_idx, ch in enumerate(chunks):
-        x = ch.to(args.device).unsqueeze(0)  # [1,1,T]
-        X = model.stft(x)
+        print(f"Encoding second {sec_idx + 1}/{len(chunks)}...")
+        
+        # Process chunk to get spectrogram dimensions
+        X = process_chunk_memory_efficient(model, ch, args.device)
         Fbins, Tframes = X.shape[-2], X.shape[-1]
+        
+        # Create message spectrogram on CPU to save GPU memory
         M_spec = torch.zeros_like(X)
 
         # Payload symbols
@@ -359,9 +447,16 @@ def main():
             if 0 <= f < Fbins and 0 <= t < Tframes:
                 M_spec[0, 0, f, t] += float(code) * float(sync_amp)
 
-        x_wm, _ = model.encode(x, M_spec)
-        x_wm = torch.clamp(x_wm, -1.0, 1.0)
+        # Encode with memory optimization
+        x_wm = encode_chunk_memory_efficient(model, ch, M_spec, args.device)
         wm_chunks.append(x_wm)
+        
+        # Clear memory after each encoding
+        del X, M_spec
+        if sec_idx % args.clear_cache_freq == 0:
+            clear_gpu_memory()
+            if torch.cuda.is_available():
+                print(f"  GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
     # Concatenate chunks and save
     x_wm_full = torch.cat([ch.squeeze(0) for ch in wm_chunks], dim=-1)  # [1,T]
