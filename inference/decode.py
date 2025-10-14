@@ -118,10 +118,10 @@ def _correlate_sync(model: INNWatermarker, x: torch.Tensor, n_fft: int, hop: int
     if K > 0 and sec_index % K != 0:
         r = sec_index % K
         code = code[r:] + code[:r]
-    # Use real part for BPSK readout
+    # Use imaginary part for BPSK readout (sync is on channel 1)
     vals = []
     for (f, t) in bins:
-        vals.append(float(X[0, 0, f, t].item()))
+        vals.append(float(X[0, 1, f, t].item()))
     if len(vals) == 0:
         return 0.0
     # normalized correlation
@@ -257,6 +257,7 @@ def main():
         # majority vote per bit index, then flatten by bit index order
         max_idx = max(all_votes.keys())
         bits: List[int] = []
+        print(f"Debug: max bit index = {max_idx}, total votes = {len(all_votes)}")
         for i in range(max_idx + 1):
             votes = all_votes.get(i, [])
             if votes:
@@ -264,6 +265,10 @@ def main():
                 zero = len(votes) - one
                 bit = 1 if one >= zero else 0
                 bits.append(bit)
+            else:
+                # Missing bit index - this could cause issues
+                print(f"Warning: Missing bit index {i}")
+                bits.append(0)  # Default to 0 for missing bits
         # Confidence as mean margin
         margins = []
         for i in range(len(bits)):

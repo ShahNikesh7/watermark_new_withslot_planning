@@ -413,12 +413,15 @@ def main():
 
     # Build per-second placement lists with bit indices and amplitudes
     print(f"Total bits: {num_bits}, repetition: {args.repeat}, using placements: {len(filtered_global)}")
+    print(f"First 10 bits: {all_bits[:10]}")
     placements_per_sec = [[] for _ in range(len(chunks))]
     for k, (sidx, f, t, a) in enumerate(filtered_global):
         bit_index = k % num_bits  # round-robin ensures r repeats per bit
         bit_val = all_bits[bit_index]
         amp = (1.0 if bit_val == 1 else -1.0) * args.base_symbol_amp * float(a)
         placements_per_sec[sidx].append((int(f), int(t), float(amp), int(bit_index)))
+        if k < 10:  # Debug first 10 placements
+            print(f"Placement {k}: sec={sidx}, bit_idx={bit_index}, bit_val={bit_val}, amp={amp:.3f}")
 
     # Encode per second, adding sync spectrogram on top of payload spectrogram
     sync_amp = args.sync_rel_amp * args.base_symbol_amp
@@ -439,13 +442,14 @@ def main():
             if 0 <= f < Fbins and 0 <= t < Tframes:
                 M_spec[0, 0, f, t] = float(amp)
 
-        # Sync symbols (BPSK on real channel)
+        # Sync symbols (BPSK on real channel) - use separate channel to avoid interference
         sync_bins = sync_per_sec[sec_idx]["bins"]
         code_vec = sync_per_sec[sec_idx]["code"]
         for (code, ft) in zip(code_vec, sync_bins):
             f, t = int(ft[0]), int(ft[1])
             if 0 <= f < Fbins and 0 <= t < Tframes:
-                M_spec[0, 0, f, t] += float(code) * float(sync_amp)
+                # Use imaginary channel for sync to avoid interference with payload
+                M_spec[0, 1, f, t] = float(code) * float(sync_amp)
 
         # Encode with memory optimization
         x_wm = encode_chunk_memory_efficient(model, ch, M_spec, args.device)
