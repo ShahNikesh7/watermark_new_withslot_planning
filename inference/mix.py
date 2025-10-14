@@ -15,7 +15,9 @@ Process:
 
 from __future__ import annotations
 import argparse
+import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -91,6 +93,32 @@ def _rms(x: torch.Tensor) -> float:
     return float(torch.sqrt((x * x).mean() + 1e-12).item())
 
 
+def _sha256_file(path: str) -> str:
+    """Compute SHA256 hash of a file"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _compute_clipping_metrics(signal: torch.Tensor) -> dict:
+    """Compute clipping and headroom metrics"""
+    max_abs = float(signal.abs().max().item())
+    clipped_samples = int((signal.abs() >= 0.99).sum().item())
+    total_samples = signal.numel()
+    clipping_ratio = clipped_samples / max(1, total_samples)
+    headroom_db = 20.0 * math.log10(max(1e-6, 1.0 / max_abs))
+    
+    return {
+        "max_abs_value": max_abs,
+        "clipped_samples": clipped_samples,
+        "total_samples": total_samples,
+        "clipping_ratio": clipping_ratio,
+        "headroom_db": headroom_db
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--wm", type=str, default="watermarked.wav")
@@ -108,6 +136,10 @@ def main():
     host, sr_h = _load_audio_mono(args.host)
     if sr_wm != TARGET_SR or sr_h != TARGET_SR:
         raise RuntimeError("Unexpected SR after resample")
+    
+    # Compute file hashes for traceability
+    wm_hash = _sha256_file(args.wm)
+    host_hash = _sha256_file(args.host)
 
     # Pick a 3s high-energy clip from watermarked
     start_wm = _find_best_clip(wm)
@@ -116,7 +148,8 @@ def main():
         wm_clip = F.pad(wm_clip, (0, CLIP_SAMPLES - wm_clip.size(-1)))
     wm_clip = _apply_fade(wm_clip, fade_ms=20.0)
 
-    # Choose random insertion point away from first/last 10%
+    # Choose deterministic insertion point away from first/last 10%
+    # Use seed to ensure reproducible results across machines
     T_host = host.size(-1)
     margin = int(0.1 * T_host)
     if T_host <= (2 * margin + CLIP_SAMPLES):
@@ -124,7 +157,9 @@ def main():
     else:
         lo = margin
         hi = T_host - margin - CLIP_SAMPLES
-        insert = random.randint(lo, hi)
+        # Use deterministic selection based on seed
+        rng = random.Random(args.seed)
+        insert = rng.randint(lo, hi)
 
     # Loudness match (RMS) to host segment
     host_seg = host[:, insert:insert + CLIP_SAMPLES]
@@ -147,14 +182,20 @@ def main():
             host_seg + wm_clip * gain, -1.0, 1.0
         )
         mode = "overlay"
+        overlay_gain = gain
     else:
         # hard replace
         out[:, insert:insert + CLIP_SAMPLES] = torch.clamp(wm_clip, -1.0, 1.0)
         mode = "replace"
+        overlay_gain = 1.0
+    
+    # Compute clipping metrics
+    clipping_metrics = _compute_clipping_metrics(out)
 
     # Save output and sidecar
     torchaudio.save(args.out, out.detach().cpu(), sample_rate=TARGET_SR)
     meta = {
+        "schema_version": "1.0",
         "mode": mode,
         "sample_rate": TARGET_SR,
         "clip_seconds": CLIP_SECONDS,
@@ -164,6 +205,17 @@ def main():
         "insert_end_sec": float((insert + CLIP_SAMPLES) / TARGET_SR),
         "wm_source_start_samples": int(start_wm),
         "wm_source_start_sec": float(start_wm / TARGET_SR),
+        "file_hashes": {
+            "wm_master_hash": wm_hash,
+            "host_track_hash": host_hash
+        },
+        "processing_params": {
+            "seed": int(args.seed),
+            "blend_db": float(args.blend_db),
+            "overlay_gain": float(overlay_gain),
+            "loudness_match_scale": float(scale)
+        },
+        "clipping_metrics": clipping_metrics
     }
     with open(args.sidecar, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

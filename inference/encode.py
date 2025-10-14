@@ -178,6 +178,37 @@ def _barker13_sequence() -> List[int]:
     return [1 if v == 1 else -1 for v in seq01]
 
 
+def _encode_second_index_to_sync(sec_idx: int, base_code: List[int], max_sec_idx: int = 1023) -> List[int]:
+    """
+    Encode the source second index into the sync code using a simple modulation scheme.
+    This allows the decoder to recover the source second index from the sync correlation.
+    
+    Args:
+        sec_idx: Source second index (0-based)
+        base_code: Base Barker sequence
+        max_sec_idx: Maximum expected second index (for modulo operation)
+    
+    Returns:
+        Modified sync code that encodes the second index
+    """
+    if sec_idx < 0 or sec_idx > max_sec_idx:
+        sec_idx = sec_idx % (max_sec_idx + 1)
+    
+    # Use a simple phase shift based on second index
+    # This creates a unique signature for each second that can be detected
+    phase_shift = sec_idx % len(base_code)
+    if phase_shift == 0:
+        return base_code.copy()
+    
+    # Rotate the code by the phase shift
+    rotated_code = base_code[phase_shift:] + base_code[:phase_shift]
+    
+    # Add a subtle amplitude modulation to encode additional bits
+    # This helps distinguish between different seconds even with similar phase shifts
+    amp_mod = 1.0 + 0.1 * (sec_idx % 4)  # 4 different amplitude levels
+    return [int(x * amp_mod) for x in rotated_code]
+
+
 def _build_sync_bins(Fbins: int, Tframes: int, sr: int, n_fft: int, K_freq: int = 8, K_time: int = 3,
                      f_low_hz: float = 200.0, f_high_hz: float = 2000.0) -> List[Tuple[int, int]]:
     # Evenly spaced frequency bins between 200–2000 Hz, and K_time evenly spaced frames per second
@@ -349,13 +380,11 @@ def main():
         # Sync bins for this second
         sync_bins = _build_sync_bins(Fbins, Tframes, sr=TARGET_SR, n_fft=n_fft, K_freq=args.sync_k_freq, K_time=args.sync_k_time,
                                      f_low_hz=args.sync_f_low, f_high_hz=args.sync_f_high)
-        # Construct sync code vector for these bins by tiling Barker-13 and rotating by sec_idx
+        # Construct sync code vector for these bins by tiling Barker-13 and encoding sec_idx
         K = len(sync_bins)
-        code_vec = (barker * ((K + len(barker) - 1) // len(barker)))[:K]
-        # rotate by sec index to encode second index (optional indexing)
-        if K > 0 and sec_idx % K != 0:
-            r = sec_idx % K
-            code_vec = code_vec[r:] + code_vec[:r]
+        base_code = (barker * ((K + len(barker) - 1) // len(barker)))[:K]
+        # Encode the source second index into the sync code
+        code_vec = _encode_second_index_to_sync(sec_idx, base_code, max_sec_idx=len(chunks)-1)
         sync_per_sec.append({
             "bins": [[int(f), int(t)] for (f, t) in sync_bins],
             "code": code_vec,
@@ -405,10 +434,24 @@ def main():
     # Assign bits with repetition r across the filtered placements
     num_bits = len(all_bits)
     need = num_bits * max(1, args.repeat)
-    if len(filtered_global) < need:
-        # reduce repetition if capacity is insufficient
-        args.repeat = max(1, len(filtered_global) // max(1, num_bits))
+    
+    # Capacity validation with clear warnings
+    total_capacity = len(filtered_global)
+    required_capacity = need
+    if total_capacity < required_capacity:
+        print(f"WARNING: Insufficient capacity for chosen repeat!")
+        print(f"  Track length: {len(chunks)} seconds")
+        print(f"  Per-second capacity: {args.per_sec_capacity}")
+        print(f"  Total available slots: {total_capacity}")
+        print(f"  Required slots (repeat={args.repeat}): {required_capacity}")
+        print(f"  Reducing repeat from {args.repeat} to {max(1, total_capacity // max(1, num_bits))}")
+        args.repeat = max(1, total_capacity // max(1, num_bits))
         need = num_bits * args.repeat
+        if need > total_capacity:
+            print(f"ERROR: Even with reduced repeat, insufficient capacity!")
+            print(f"  This will result in decode confidence issues.")
+            raise RuntimeError(f"Insufficient capacity: need {need}, have {total_capacity}")
+    
     filtered_global = filtered_global[:need]
 
     # Build per-second placement lists with bit indices and amplitudes
@@ -469,8 +512,13 @@ def main():
 
     # Build JSON slots map
     fingerprint = file_hash_hex
+    # Get model hash for reproducibility
+    model_hash = hashlib.sha256(str(state.get("model_state", {})).encode()).hexdigest()[:16]
     slots_json = {
+        "schema_version": "1.0",
         "audio_fingerprint": fingerprint,
+        "model_id": os.path.basename(ckpt_path),
+        "model_hash": model_hash,
         "sample_rate": TARGET_SR,
         "stft": {"n_fft": n_fft, "hop": hop, "win_length": n_fft},
         "planner_seed": int(args.seed),
@@ -492,6 +540,14 @@ def main():
         )),
         "repeat": int(args.repeat),
         "base_symbol_amp": float(args.base_symbol_amp),
+        "psychoacoustic_params": {
+            "per_sec_capacity": int(args.per_sec_capacity),
+            "amp_safety_factor": 1.0,
+            "actual_per_sec_capacity": int(len(filtered_global) / len(chunks)) if len(chunks) > 0 else 0,
+            "total_available_slots": int(len(filtered_global)),
+            "total_required_slots": int(need),
+            "capacity_utilization": float(len(filtered_global) / max(1, need)) if need > 0 else 0.0
+        },
         "placements": [],  # list per second
     }
 
