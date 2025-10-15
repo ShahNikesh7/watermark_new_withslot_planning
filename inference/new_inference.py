@@ -303,7 +303,7 @@ def main():
             recovered_text = ""
 
     # Save outputs (ensure tensors are detached for CPU/GPU compatibility)
-    torchaudio.save(args.out, x_wm_full.detach().cpu(), sample_rate=TARGET_SR)
+    torchaudio.save(args.out, x_wm_full.detach().cpu(), sample_rate=TARGET_SR, encoding="PCM_S", bits_per_sample=24)
     _save_spectrogram_side_by_side(x_full.to(args.device).detach(), x_wm_full.to(args.device).detach(), n_fft=n_fft, hop=hop, out_path=args.spec_out)
 
     print(f"BER={ber:.6f}")

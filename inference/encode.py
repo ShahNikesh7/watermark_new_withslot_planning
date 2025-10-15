@@ -378,7 +378,7 @@ def main():
     parser.add_argument("--slots_json", type=str, default=os.path.join(ROOT, "slots_map.json"))
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     # Payload inputs
-    parser.add_argument("--metadata", type=str, default="ISRCISRC12345678910ISWCISWC12345678910Dur260sRDate20251010")
+    parser.add_argument("--metadata", type=str, default="ISRCQZ-WBS-25-00059NatmbompktkTNdivorceyourself")
     parser.add_argument("--payload_bytes", type=int, default=125, help="Raw payload bytes before RS")
     parser.add_argument("--interleave", type=int, default=4)
     # Planner and embedding
@@ -755,7 +755,7 @@ def main():
     print(f"LUFS difference: {final_lufs - original_lufs:.2f} dB")
     
     print(f"Saving watermarked audio to: {out_wav_path}")
-    torchaudio.save(out_wav_path, wav_wm_stereo.detach().cpu(), sample_rate=original_sr)
+    torchaudio.save(out_wav_path, wav_wm_stereo.detach().cpu(), sample_rate=original_sr, encoding="PCM_S", bits_per_sample=24)
 
     # Build JSON slots map
     fingerprint = file_hash_hex
