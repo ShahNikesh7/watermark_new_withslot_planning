@@ -204,12 +204,12 @@ def _preserve_dynamic_range(original: torch.Tensor, watermarked: torch.Tensor) -
     
     return watermarked * scale_factor
 
-def _apply_loudness_matching(original: torch.Tensor, watermarked: torch.Tensor, target_lufs: float) -> torch.Tensor:
+def _apply_loudness_matching(original: torch.Tensor, watermarked: torch.Tensor, target_lufs: float, sr: int) -> torch.Tensor:
     """Apply loudness matching to preserve original LUFS while maintaining dynamics"""
     # First preserve dynamic range to prevent volume ducking
     watermarked = _preserve_dynamic_range(original, watermarked)
     
-    current_lufs = _measure_lufs(watermarked, TARGET_SR)
+    current_lufs = _measure_lufs(watermarked, sr)
     lufs_diff = target_lufs - current_lufs
     gain_db = lufs_diff
     gain_linear = 10.0 ** (gain_db / 20.0)
@@ -217,13 +217,10 @@ def _apply_loudness_matching(original: torch.Tensor, watermarked: torch.Tensor, 
     # Apply gain but preserve true-peak headroom and dynamics
     matched = watermarked * gain_linear
     
-    # More conservative limiting to preserve transients
+    # Preserve headroom with linear scaling to avoid nonlinear distortion
     peak = matched.abs().max()
-    if peak > 0.98:  # Only limit if very close to clipping
-        # Use gentle compression instead of hard limiting to preserve transients
-        ratio = 0.98 / peak
-        # Apply gentle compression curve to preserve dynamics
-        matched = torch.tanh(matched * (1.0 / 0.98)) * 0.98
+    if peak > 0.98:
+        matched = matched * (0.98 / peak)
     
     return matched
 
@@ -350,6 +347,11 @@ def _build_sync_bins(Fbins: int, Tframes: int, sr: int, n_fft: int, K_freq: int 
     return bins
 
 
+"""
+Sibilance/onset automatic skipping removed per user request. Protected ranges are used instead.
+"""
+
+
 @dataclass
 class SyncSpec:
     code_family: str
@@ -391,9 +393,16 @@ def main():
     parser.add_argument("--sync_k_time", type=int, default=3)
     parser.add_argument("--sync_f_low", type=float, default=200.0)
     parser.add_argument("--sync_f_high", type=float, default=2000.0)
+# (Removed sibilance/onset automatic skipping; use protected ranges instead)
+    # User-provided protected regions (skip encoding)
+    parser.add_argument("--protected_ranges_json", type=str, default="", help="Path to JSON with protected time ranges in seconds")
+    parser.add_argument("--skip_sync_in_protected", type=int, default=0, help="Also skip sync embedding inside protected ranges (1/0)")
     # Memory optimization options
     parser.add_argument("--batch_size", type=int, default=1, help="Process multiple seconds at once (1 for memory efficiency)")
     parser.add_argument("--clear_cache_freq", type=int, default=1, help="Clear GPU cache every N seconds")
+    # Output encoding controls
+    parser.add_argument("--pcm_bits", type=int, default=24, choices=[16,24,32], help="Output PCM bit depth")
+    parser.add_argument("--pcm_encoding", type=str, default="PCM_S", choices=["PCM_S","PCM_F"], help="Output PCM encoding signed or float")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -425,8 +434,8 @@ def main():
     state = torch.load(ckpt_path, map_location=args.device, weights_only=False)
     cfg = state.get("cfg", {})
     n_fft = int(cfg.get("n_fft", 1024))
-    hop = int(cfg.get("hop", 512))
-    
+    #hop = int(cfg.get("hop", 512))
+    hop = 441
     # Create model and move to device
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": n_fft, "hop_length": hop, "win_length": n_fft})
     model.load_state_dict(state.get("model_state", state), strict=False)
@@ -471,6 +480,24 @@ def main():
     
     chunks = _chunk_audio_1s(mid_22k)  # list of [1,T] at 22.05kHz
 
+    # Load protected time ranges (in seconds)
+    protected_ranges: List[Tuple[float, float]] = []
+    if args.protected_ranges_json:
+        ppath = os.path.abspath(args.protected_ranges_json)
+        if os.path.isfile(ppath):
+            with open(ppath, "r", encoding="utf-8") as pf:
+                try:
+                    data = json.load(pf)
+                    for item in data:
+                        if isinstance(item, dict) and "start" in item and "end" in item:
+                            protected_ranges.append((float(item["start"]), float(item["end"])) )
+                        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                            protected_ranges.append((float(item[0]), float(item[1])))
+                except Exception as e:
+                    print(f"WARNING: Failed to parse protected ranges JSON: {e}")
+        else:
+            print(f"WARNING: Protected ranges JSON not found: {ppath}")
+
     # Build payload bytes from metadata string using 6-bit packer (demo)
     # metadata format: key=value;key=value;...
     fields: Dict[str, str] = {}
@@ -508,12 +535,28 @@ def main():
     print("Planning slots and sync per second...")
     # First pass: compute per-second candidate payload slots with memory optimization
     per_sec_candidates: List[List[Tuple[int,int,float]]] = []  # [(f,t,amp_scale)]
+    protected_mask_per_sec: List[torch.Tensor] = []
+    protected_telemetry: List[Dict[str, float]] = []
     for sec_idx, ch in enumerate(chunks):
         print(f"Processing second {sec_idx + 1}/{len(chunks)}...")
         
         # Use memory-efficient processing
         X = process_chunk_memory_efficient(model, ch, args.device)
         Fbins, Tframes = X.shape[-2], X.shape[-1]
+
+        # Compute protected mask for this second from protected ranges
+        # Determine time span for this chunk (seconds at TARGET_SR)
+        sec_start = sec_idx * CHUNK_SECONDS
+        sec_end = sec_start + CHUNK_SECONDS
+        Tframes = X.shape[-1]
+        frame_times = torch.linspace(sec_start, sec_end, steps=Tframes, dtype=torch.float32)
+        prot_mask = torch.zeros((Tframes,), dtype=torch.bool)
+        for (ts, te) in protected_ranges:
+            # Mark frames whose time falls within [ts, te)
+            in_range = (frame_times >= float(ts)) & (frame_times < float(te))
+            if in_range.any():
+                prot_mask |= in_range
+        protected_mask_per_sec.append(prot_mask)
 
         # Sync bins for this second
         sync_bins = _build_sync_bins(Fbins, Tframes, sr=TARGET_SR, n_fft=n_fft, K_freq=args.sync_k_freq, K_time=args.sync_k_time,
@@ -535,12 +578,26 @@ def main():
         # Remove any slots that collide with sync bins
         sync_set = set(sync_bins)
         cand: List[Tuple[int,int,float]] = []
+        skipped_due_to_protected = 0
         for i, (f, t) in enumerate(slots):
             if (f, t) in sync_set:
                 continue
             amp_scale = float(amp_per_slot[i]) if i < len(amp_per_slot) else 1.0
+            # Skip frames in protected ranges
+            if 0 <= int(t) < int(Tframes) and bool(prot_mask[int(t)].item()):
+                skipped_due_to_protected += 1
+                continue
             cand.append((int(f), int(t), amp_scale))
         per_sec_candidates.append(cand)
+
+        # Record telemetry for this second
+        protected_telemetry.append({
+            "second": int(sec_idx),
+            "frames_total": int(Tframes),
+            "frames_protected": int(prot_mask.sum().item()),
+            "protected_ratio": float(float(prot_mask.sum().item()) / max(1, Tframes)),
+            "slots_skipped_in_planning": int(skipped_due_to_protected)
+        })
         
         # Clear memory after each second
         del X
@@ -636,6 +693,20 @@ def main():
         # Process chunk to get spectrogram dimensions
         X = process_chunk_memory_efficient(model, ch, args.device)
         Fbins, Tframes = X.shape[-2], X.shape[-1]
+        if sec_idx < len(protected_mask_per_sec):
+            prot_mask = protected_mask_per_sec[sec_idx]
+        else:
+            # Build protected mask as fallback (should not usually happen here)
+            Tframes = X.shape[-1]
+            sec_start = sec_idx * CHUNK_SECONDS
+            sec_end = sec_start + CHUNK_SECONDS
+            frame_times = torch.linspace(sec_start, sec_end, steps=Tframes, dtype=torch.float32)
+            prot_mask = torch.zeros((Tframes,), dtype=torch.bool)
+            for (ts, te) in protected_ranges:
+                in_range = (frame_times >= float(ts)) & (frame_times < float(te))
+                if in_range.any():
+                    prot_mask |= in_range
+            protected_mask_per_sec.append(prot_mask)
         
         # Create message spectrogram on CPU to save GPU memory
         M_spec = torch.zeros_like(X)
@@ -653,6 +724,9 @@ def main():
         for (code, ft) in zip(code_vec, sync_bins):
             f, t = int(ft[0]), int(ft[1])
             if 0 <= f < Fbins and 0 <= t < Tframes:
+                if int(args.skip_sync_in_protected) == 1 and 0 <= int(t) < int(Tframes):
+                    if bool(prot_mask[int(t)].item()):
+                        continue
                 # Use imaginary channel for sync to avoid interference with payload
                 # Scale sync amplitude more conservatively
                 scaled_sync_amp = float(sync_amp) * 0.8  # Reduce sync amplitude
@@ -734,7 +808,7 @@ def main():
     
     # Apply loudness matching to preserve original LUFS
     print("Applying loudness matching...")
-    mid_wm_matched = _apply_loudness_matching(mid_component, mid_wm_original, original_lufs)
+    mid_wm_matched = _apply_loudness_matching(mid_component, mid_wm_original, original_lufs, original_sr)
     
     # Reconstruct stereo: watermarked mid + original side
     wav_wm_stereo = _reconstruct_stereo(mid_wm_matched, side_component)
@@ -742,20 +816,47 @@ def main():
     # Ensure consistent data type
     wav_wm_stereo = wav_wm_stereo.float()
     
-    # Final gentle limiting to prevent clipping while preserving dynamics
+    # Final linear peak scaling to prevent clipping while preserving dynamics
     peak = wav_wm_stereo.abs().max()
     if peak > 0.99:
-        print(f"Applying gentle limiting: peak was {peak:.3f}")
-        # Use gentle compression instead of hard limiting to preserve transients
-        wav_wm_stereo = torch.tanh(wav_wm_stereo * (1.0 / 0.99)) * 0.99
+        print(f"Applying linear peak scaling: peak was {peak:.3f}")
+        wav_wm_stereo = wav_wm_stereo * (0.99 / peak)
     
     # Measure final LUFS
     final_lufs = _measure_lufs(mid_wm_matched, original_sr)
     print(f"Final LUFS: {final_lufs:.2f} dB (target: {original_lufs:.2f} dB)")
     print(f"LUFS difference: {final_lufs - original_lufs:.2f} dB")
     
+    # Audio integrity metrics
+    def _metrics(signal: torch.Tensor) -> Dict[str, float]:
+        peak = float(signal.abs().max().item())
+        rms = float(torch.sqrt(torch.mean(signal * signal)).item())
+        crest = float(peak / max(1e-9, rms))
+        mean = float(signal.mean().item())
+        return {"peak": peak, "rms": rms, "crest": crest, "mean": mean}
+    
+    # Compare mid components at original SR
+    mid_original_resr = mid_component
+    mid_wm_resr = mid_wm_matched
+    # Ensure same length
+    min_len = min(mid_original_resr.size(-1), mid_wm_resr.size(-1))
+    mid_original_resr = mid_original_resr[..., :min_len]
+    mid_wm_resr = mid_wm_resr[..., :min_len]
+    diff = (mid_wm_resr - mid_original_resr).squeeze(0)
+    sig = mid_original_resr.squeeze(0)
+    noise = diff
+    snr = 10.0 * math.log10(max(1e-12, float(torch.sum(sig * sig).item())) / max(1e-12, float(torch.sum(noise * noise).item())))
+    
+    # Stereo correlation between channels after reconstruction
+    left = wav_wm_stereo[0]
+    right = wav_wm_stereo[1]
+    l_centered = left - left.mean()
+    r_centered = right - right.mean()
+    denom = math.sqrt(float(torch.sum(l_centered * l_centered).item()) * float(torch.sum(r_centered * r_centered).item()))
+    lr_corr = float(torch.sum(l_centered * r_centered).item() / max(1e-12, denom))
+    
     print(f"Saving watermarked audio to: {out_wav_path}")
-    torchaudio.save(out_wav_path, wav_wm_stereo.detach().cpu(), sample_rate=original_sr, encoding="PCM_S", bits_per_sample=24)
+    torchaudio.save(out_wav_path, wav_wm_stereo.detach().cpu(), sample_rate=original_sr, encoding=str(args.pcm_encoding), bits_per_sample=int(args.pcm_bits))
 
     # Build JSON slots map
     fingerprint = file_hash_hex
@@ -834,6 +935,12 @@ def main():
             "total_encoded_symbols": int(len(filtered_global)),
             "capacity_warning_issued": total_capacity < required_capacity
         },
+        # sibilance/onset policies removed per user request
+        "protected_regions_policy": {
+            "provided": bool(len(protected_ranges) > 0),
+            "ranges": [[float(s), float(e)] for (s, e) in protected_ranges],
+            "skip_sync_in_protected": bool(int(args.skip_sync_in_protected) == 1)
+        },
         "repetition_distribution": {
             "policy": "round_robin_with_global_shuffle",
             "min_seconds_per_bit": min(len(bit_distribution[bit_idx]["seconds_covered"]) for bit_idx in bit_distribution) if bit_distribution else 0,
@@ -853,6 +960,15 @@ def main():
             },
             "per_second": clipping_telemetry
         },
+        "audio_integrity": {
+            "original_mid": _metrics(mid_original_resr.squeeze(0)),
+            "watermarked_mid": _metrics(mid_wm_resr.squeeze(0)),
+            "snr_db": float(snr),
+            "stereo_lr_correlation": float(lr_corr),
+            "notes": "Linear headroom scaling applied to avoid limiter coloration"
+        },
+        # sibilance/onset telemetry removed
+        "protected_telemetry": protected_telemetry,
         "placements": [],  # list per second
     }
 
